@@ -1,6 +1,43 @@
 const std = @import("std");
-const InstrumentationScope = @import("../../scope.zig").InstrumentationScope;
+
 const Attributes = @import("../../attributes.zig").Attributes;
+const Attribute = @import("../../attributes.zig").Attribute;
+const InstrumentationScope = @import("../../scope.zig").InstrumentationScope;
+
+const Severity = enum {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+
+    pub fn name(self: Severity, allocator: std.mem.Allocator) ![]const u8 {
+        switch (self) {
+            inline else => {
+                const tagName = @tagName(self);
+                const a = try allocator.alloc(u8, tagName.len);
+
+                for (tagName, 0..) |c, index| {
+                    a[index] = std.ascii.toUpper(c);
+                }
+
+                return a;
+            }
+        }
+    }
+};
+
+pub const LogRecord = struct {
+    timestamp: ?u64,
+    observed_timestamp: ?u64,
+    trace_id: ?[16]u8,
+    span_id: ?[8]u8,
+    severity: ?Severity,
+    body: ?[]const u8,
+    attributes: ?[]const Attribute,
+    event_name: ?[]const u8,
+};
 
 /// Logger is responsible for emitting logs as LogRecords.
 /// see: https://opentelemetry.io/docs/specs/otel/logs/api/#logger
@@ -19,6 +56,13 @@ pub const Logger = struct {
         };
 
         return logger;
+    }
+
+    pub fn emit(
+        _: ?[]const u8,
+
+    ) void {
+
     }
 
     pub fn deinit(self: *Self) void {
@@ -141,4 +185,14 @@ test "logger exactly the same when getting one with same scope" {
     const lg2 = try lp.getLogger(scope);
 
     try std.testing.expectEqualDeep(lg, lg2);
+}
+
+
+test "logger severity should return upper case string" {
+    const allocator = std.testing.allocator;
+
+    const actual = try Severity.Trace.name(allocator);
+    defer allocator.free(actual);
+
+    try std.testing.expectEqualSlices(u8, "TRACE", actual);
 }
