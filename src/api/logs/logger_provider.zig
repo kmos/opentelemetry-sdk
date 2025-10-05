@@ -12,7 +12,9 @@ const Severity = enum {
     Error,
     Fatal,
 
-    pub fn name(self: Severity, allocator: std.mem.Allocator) ![]const u8 {
+    const Self = @This();
+
+    pub fn name(self: Self, allocator: std.mem.Allocator) ![]const u8 {
         switch (self) {
             inline else => {
                 const tagName = @tagName(self);
@@ -26,17 +28,100 @@ const Severity = enum {
             }
         }
     }
+
+    /// Convert Severity to severity number (1-24) as per OpenTelemetry spec
+    /// see: https://opentelemetry.io/docs/specs/otel/logs/data-model/#field-severitynumber
+    pub fn toNumber(self: Self) u8 {
+        return switch (self) {
+            .Trace => 1,
+            .Debug => 5,
+            .Info => 9,
+            .Warn => 13,
+            .Error => 17,
+            .Fatal => 21,
+        };
+    }
 };
 
-pub const LogRecord = struct {
+/// ReadWriteLogRecord is a mutable log record used during emission.
+/// Processors can modify this record, and mutations are visible to subsequent processors.
+/// see: https://opentelemetry.io/docs/specs/otel/logs/sdk/#logrecordprocessor
+pub const ReadWriteLogRecord = struct {
     timestamp: ?u64,
-    observed_timestamp: ?u64,
+    observed_timestamp: u64,
     trace_id: ?[16]u8,
     span_id: ?[8]u8,
-    severity: ?Severity,
+    severity_number: ?u8,
+    severity_text: ?[]const u8,
     body: ?[]const u8,
-    attributes: ?[]const Attribute,
-    event_name: ?[]const u8,
+    attributes: std.ArrayListUnmanaged(Attribute),
+    resource: ?*const anyopaque,
+    scope: InstrumentationScope,
+
+    const Self = @This();
+
+    pub fn init(_: std.mem.Allocator, scope: InstrumentationScope) Self {
+        return Self{
+            .timestamp = null,
+            .observed_timestamp = @intCast(std.time.nanoTimestamp()),
+            .trace_id = null,
+            .span_id = null,
+            .severity_number = null,
+            .severity_text = null,
+            .body = null,
+            .attributes = std.ArrayListUnmanaged(Attribute){},
+            .resource = null,
+            .scope = scope,
+        };
+    }
+
+    pub fn setAttribute(self: *Self, allocator: std.mem.Allocator, attribute: Attribute) !void {
+        try self.attributes.append(allocator, attribute);
+    }
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        self.attributes.deinit(allocator);
+    }
+
+    /// Convert to immutable ReadableLogRecord for export
+    pub fn toReadable(self: *const Self, allocator: std.mem.Allocator) !ReadableLogRecord {
+        const attrs = try allocator.alloc(Attribute, self.attributes.items.len);
+        @memcpy(attrs, self.attributes.items);
+
+        return ReadableLogRecord{
+            .timestamp = self.timestamp,
+            .observed_timestamp = self.observed_timestamp,
+            .trace_id = self.trace_id,
+            .span_id = self.span_id,
+            .severity_number = self.severity_number,
+            .severity_text = self.severity_text,
+            .body = self.body,
+            .attributes = attrs,
+            .resource = self.resource,
+            .scope = self.scope,
+        };
+    }
+};
+
+/// ReadableLogRecord is an immutable log record passed to exporters.
+/// see: https://opentelemetry.io/docs/specs/otel/logs/sdk/#logrecordexporter
+pub const ReadableLogRecord = struct {
+    timestamp: ?u64,
+    observed_timestamp: u64,
+    trace_id: ?[16]u8,
+    span_id: ?[8]u8,
+    severity_number: ?u8,
+    severity_text: ?[]const u8,
+    body: ?[]const u8,
+    attributes: []const Attribute,
+    resource: ?*const anyopaque,
+    scope: InstrumentationScope,
+
+    const Self = @This();
+
+    pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+        allocator.free(self.attributes);
+    }
 };
 
 /// Logger is responsible for emitting logs as LogRecords.
@@ -195,4 +280,60 @@ test "logger severity should return upper case string" {
     defer allocator.free(actual);
 
     try std.testing.expectEqualSlices(u8, "TRACE", actual);
+}
+
+test "severity to number conversion" {
+    try std.testing.expectEqual(@as(u8, 1), Severity.Trace.toNumber());
+    try std.testing.expectEqual(@as(u8, 5), Severity.Debug.toNumber());
+    try std.testing.expectEqual(@as(u8, 9), Severity.Info.toNumber());
+    try std.testing.expectEqual(@as(u8, 13), Severity.Warn.toNumber());
+    try std.testing.expectEqual(@as(u8, 17), Severity.Error.toNumber());
+    try std.testing.expectEqual(@as(u8, 21), Severity.Fatal.toNumber());
+}
+
+test "ReadWriteLogRecord init and deinit" {
+    const allocator = std.testing.allocator;
+    const scope = InstrumentationScope{ .name = "test-logger" };
+
+    var log_record = ReadWriteLogRecord.init(allocator, scope);
+    defer log_record.deinit(allocator);
+
+    try std.testing.expectEqual(scope, log_record.scope);
+    try std.testing.expect(log_record.observed_timestamp > 0);
+}
+
+test "ReadWriteLogRecord setAttribute" {
+    const allocator = std.testing.allocator;
+    const scope = InstrumentationScope{ .name = "test-logger" };
+
+    var log_record = ReadWriteLogRecord.init(allocator, scope);
+    defer log_record.deinit(allocator);
+
+    const attr = Attribute{ .key = "test.key", .value = .{ .string = "test.value" } };
+    try log_record.setAttribute(allocator, attr);
+
+    try std.testing.expectEqual(@as(usize, 1), log_record.attributes.items.len);
+    try std.testing.expectEqualStrings("test.key", log_record.attributes.items[0].key);
+}
+
+test "ReadWriteLogRecord to ReadableLogRecord conversion" {
+    const allocator = std.testing.allocator;
+    const scope = InstrumentationScope{ .name = "test-logger" };
+
+    var rw_record = ReadWriteLogRecord.init(allocator, scope);
+    defer rw_record.deinit(allocator);
+
+    rw_record.body = "test message";
+    rw_record.severity_number = 9;
+
+    const attr = Attribute{ .key = "test.key", .value = .{ .string = "test.value" } };
+    try rw_record.setAttribute(allocator, attr);
+
+    const readable = try rw_record.toReadable(allocator);
+    defer readable.deinit(allocator);
+
+    try std.testing.expectEqualStrings("test message", readable.body.?);
+    try std.testing.expectEqual(@as(u8, 9), readable.severity_number.?);
+    try std.testing.expectEqual(@as(usize, 1), readable.attributes.len);
+    try std.testing.expectEqualStrings("test.key", readable.attributes[0].key);
 }
